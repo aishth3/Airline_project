@@ -1,0 +1,1586 @@
+import base64
+import io
+import itertools
+import os
+from datetime import datetime, timedelta
+from geopy.distance import geodesic
+import math
+import folium
+import pandas as pd
+import pytz
+from timezonefinder import TimezoneFinder
+import numpy as np
+from scipy.special import comb
+from folium.plugins import FeatureGroupSubGroup
+import plotly.graph_objs as go
+
+import dash
+from dash import dcc, html, dash_table
+from dash.dependencies import Input, Output, State
+import dash_bootstrap_components as dbc
+from dash.dash_table.Format import Format, Scheme
+from flask import session, redirect, url_for, request
+from flask_session import Session
+
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+# Initialize the Dash app
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
+app.server.secret_key = os.urandom(24)  # Set the secret key
+
+# Configure server-side session
+app.server.config['SESSION_TYPE'] = 'filesystem'
+app.server.config['SESSION_PERMANENT'] = False  # Ensure the session expires when the browser is closed
+app.server.config['PERMANENT_SESSION_LIFETIME'] = timedelta(
+    minutes=1200)  # Optional: Session lifetime for extra security
+Session(app.server)
+
+# Define valid username and password pairs
+VALID_USERNAME_PASSWORD_PAIRS = {
+    'Aish': '123',
+    'Hari': '1972',
+    'Samyuktha':'Samyuktha@21'
+}
+
+
+def check_login():
+    return session.get('logged_in')
+
+
+def authenticate_user(username, password):
+    if username in VALID_USERNAME_PASSWORD_PAIRS and VALID_USERNAME_PASSWORD_PAIRS[username] == password:
+        session['logged_in'] = True
+        session['username'] = username  # Store username in session
+        session.pop('login_error', None)  # Clear any existing login error
+        return True
+    session['login_error'] = True  # Set login error flag
+    return False
+
+
+@app.server.before_request
+def before_request():
+    if not check_login() and request.endpoint not in ['login', 'static']:
+        session.clear()  # Clear session data if the user is not logged in
+        return redirect(url_for('login'))
+
+
+@app.server.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if authenticate_user(username, password):
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        else:
+            session['login_error'] = True  # Set login error flag
+
+    error_message = ''
+    if 'login_error' in session:
+        error_message = 'Wrong attempt, try again.'
+        session.pop('login_error')  # Clear the error message
+
+    return f'''
+        <div style="display: flex; justify-content: center; align-items: center; height: 100vh;">
+            <form method="post">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username"><br>
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password"><br>
+                <input type="submit" value="Login"><br>
+                <span style="color:red;">{error_message}</span>
+            </form>
+        </div>
+    '''
+
+
+@app.server.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    session.clear()  # Clear all session data
+    return redirect(url_for('login'))  # Redirect to login page after logging out
+
+
+@app.server.route('/help')
+def help_page():
+    return '''
+        <div style="margin: 20px;">
+            <h1 style="text-align: center;">Help Page</h1>
+            <p>Welcome to the Airline Fare Analysis Dashboard. This guide will help you navigate through the application and utilize its features effectively.</p>
+
+            <h2>Logging In</h2>
+            <ol>
+                <li>Enter your username and password on the login page.</li>
+                <li>Click 'Login' to access the dashboard.</li>
+            </ol>
+
+            <h2>Uploading Data</h2>
+            <ol>
+                <li>Use the 'Upload file' button to upload your Excel file.</li>
+                <li>Ensure the file is in .xlsx format.</li>
+                <li>Once uploaded, the file name will be displayed, and the data will be loaded into the dashboard.</li>
+            </ol>
+
+            <h2>Using Tabs</h2>
+            <p>Navigate through the following tabs to view and analyze your data:</p>
+            <ol>
+                <li><strong>Table Data:</strong> View the uploaded data in a tabular format. Use filters to refine the displayed data.</li>
+                <li><strong>Map Visualization:</strong> Visualize flight routes on an interactive map.</li>
+                <li><strong>Analytics:</strong> View box plot analyses of flight prices by carrier.</li>
+                <li><strong>Trendline View:</strong> Analyze price trends over time for different airlines.</li>
+            </ol>
+
+            <h2>Setting Parameters</h2>
+            <ol>
+                <li>Click on the 'Menu' button located in the top-right corner.</li>
+                <li>Select 'Parameters' from the dropdown menu.</li>
+                <li>Adjust the decimal points for numerical precision in the analysis. The default is set to 2 decimal points.</li>
+                <li>The table and graphs will automatically update based on the selected parameter.</li>
+            </ol>
+
+            <h2>Sign Out</h2>
+            <ol>
+                <li>Click the 'Sign Out' button located in the top-right corner.</li>
+                <li>You will be redirected to the login page.</li>
+                <li>For security reasons, ensure to sign out when you are finished using the application.</li>
+            </ol>
+
+            <br/>
+            <p>For any further assistance, please contact the support team.</p>
+            <p>Contact number 971xxxxxxx</p>
+
+            <h2>Thankyou </h2>
+            <a href="/">Go Back</a>
+        </div>
+    '''
+
+
+@app.server.route('/')
+def index():
+    return redirect('/dash')
+
+
+@app.callback(
+    Output('url', 'pathname'),
+    Input('sign-out-button', 'n_clicks')
+)
+def sign_out(n_clicks):
+    if n_clicks:
+        session.pop('logged_in', None)
+        session.clear()  # Clear all session data
+        return '/logout'  # Redirect to logout route
+    return dash.no_update
+
+
+# Load the airport codes dataframe
+airports_code_df = pd.read_excel('C:/Users/santh/Downloads/airports-code.xlsx')
+
+upload_file = dbc.Row([
+    dbc.Col(dcc.Upload(
+        id="upload-data",
+        children=html.Div(["Drag and Drop or ", html.A("Select Files")]),
+        style={
+            "width": "100%",
+            "height": "60px",
+            "lineHeight": "60px",
+            "borderWidth": "1px",
+            "borderStyle": "dashed",
+            "borderRadius": "5px",
+            "textAlign": "center",
+            "margin": "10px",
+            "color": "Black"
+        },
+        multiple=False
+    ), md=6),
+    dbc.Col(dbc.Button(id='up-button', children='Upload file', n_clicks=0,
+                       style={"textAlign": "center", "width": "150px", "backgroundColor": "Black",
+                              "color": "white", "borderColor": "black"}), md=4),
+    dbc.Col(dcc.Loading(id="loading-spinner", type="circle", children=[html.Div(id='loading-output')]), md=2),
+    html.Div(id='uploaded_filename'),
+    html.Div(id='message', children='Please upload an Excel file.'),  # Ensure this line is present
+    html.Div(id='data-loaded-message')
+], align="center")
+
+filters = dbc.Row([
+    dbc.Col(html.Div([
+        dbc.Label("Outbound Departure Date Range"),
+        dcc.DatePickerRange(id='outbound-date-picker-range', start_date_placeholder_text='Start Date',
+                            end_date_placeholder_text='End Date')
+    ]), width=3),
+    dbc.Col(html.Div([
+        dbc.Label("Inbound Departure Date Range"),
+        dcc.DatePickerRange(id='inbound-date-picker-range', start_date_placeholder_text='Start Date',
+                            end_date_placeholder_text='End Date')
+    ]), width=3),
+    dbc.Col(html.Div([
+        dbc.Label("Time of Day (Outbound)"),
+        dcc.Checklist(id='time-of-day', options=[
+            {'label': 'Morning', 'value': 'morning'},
+            {'label': 'Afternoon', 'value': 'afternoon'},
+            {'label': 'Evening', 'value': 'evening'},
+            {'label': 'Night', 'value': 'night'},
+        ], inline=True)
+    ]), width=3),
+    dbc.Col(html.Div([
+        dbc.Label("Airline"),
+        dcc.Checklist(
+            id='airline',
+            options=[],
+            inline=True,
+            inputStyle={"margin-right": "3px"},  # Space between checkbox and label
+            labelStyle={"margin-right": "15px", "margin-bottom": "10px"}  # Space between each item
+        )
+    ]), width=3),
+])
+
+toggle_button = dbc.Row([
+    dbc.Col(dbc.RadioItems(
+        id='y-axis-toggle',
+        options=[
+            {'label': 'Price', 'value': 'price'},
+            {'label': 'Price per km', 'value': 'price_per_km'},
+            {'label': 'Travel Time Comparison', 'value': 'inbound_travel_time'}
+        ],
+        value='price',  # Default value
+        inline=True
+    ), width=12)
+], style={'marginBottom': '20px'})
+
+data_display = dbc.Row([
+    dbc.Col(html.Div([dash_table.DataTable(
+        id='table',
+        columns=[],
+        data=[],
+        style_data={'backgroundColor': 'White', 'color': 'Black'},
+        style_header={'backgroundColor': 'Black', 'fontWeight': 'bold', 'color': 'white'},
+        filter_action="native", sort_action="native", page_current=0, page_size=10,
+        export_format='csv', export_headers='display',
+    )], id='table-container', style={'display': 'none'}), width=12),
+    html.Br(),
+    html.Iframe(id='map-tab', srcDoc=None, width='100%', height='600')
+])
+
+route_filter = dbc.Row([
+    dbc.Col(html.Div([
+        dbc.Label("Route Type"),
+        dcc.Dropdown(id='route-type', options=[
+            {'label': 'Outbound', 'value': 'outbound'},
+            {'label': 'Inbound', 'value': 'inbound'},
+            {'label': 'Both', 'value': 'both'}
+        ], value='outbound', style={'width': '100%'})
+    ]), width=3),
+])
+
+analytics_display = dbc.Row([
+    dbc.Col(dcc.RadioItems(
+        id='plot-selector',
+        options=[
+            {'label': 'Box Plot', 'value': 'box'},
+            {'label': 'Distribution Plot', 'value': 'distribution'}
+        ],
+        value='box',
+        inline=True,
+        labelStyle={'display': 'inline-block', 'margin-right': '10px'}
+    ), width="auto"),
+    dcc.Loading(id='loading-boxplot', children=[
+        dcc.Graph(id='box-plot', style={'width': '90vw', 'height': '90vh', 'display': 'block'})
+    ]),
+    dcc.Loading(id='loading-distribution', children=[
+        dcc.Graph(id='distribution-plot', style={'width': '90vw', 'height': '90vh', 'display': 'none'})
+    ])
+], style={'width': '90vw', 'height': '90vh'})
+
+trendline_display = dbc.Container([
+    dbc.Row([
+        dbc.Col(dbc.Checkbox(id='smooth-checkbox', label='Smoothen', value=False), width="auto")
+    ], justify="center", style={'padding': '20px 0'}),
+    dbc.Row([
+        dcc.Loading(id='loading-trendline', children=[
+            dcc.Graph(id='trendline-plot', style={'width': '90vw', 'height': '90vh'}),
+        ])
+    ])
+], fluid=True)
+
+
+
+parameter_filter = html.Div([
+    dbc.Row([
+        dbc.Col(html.Div([
+            dbc.Label("Decimal Points"),
+            dcc.Input(id='decimal-points', type='number', value=2, min=0, step=1)
+        ]), width=3),
+    ])
+], id='parameter-filter', style={'display': 'none'})  # Initially hidden
+
+help_modal = dbc.Modal(
+    [
+        dbc.ModalHeader("Help Page"),
+        dbc.ModalBody(html.Div([
+            html.H1("Help Page", style={"text-align": "center"}),
+            html.P("Welcome to the Airline Fare Analysis Dashboard. This guide will help you navigate through the application and utilize its features effectively."),
+            html.H2("Logging In"),
+            html.Ol([
+                html.Li("Enter your username and password on the login page."),
+                html.Li("Click 'Login' to access the dashboard.")
+            ]),
+            html.H2("Uploading Data"),
+            html.Ol([
+                html.Li("Use the 'Upload file' button to upload your Excel file."),
+                html.Li("Ensure the file is in .xlsx format."),
+                html.Li("Once uploaded, the file name will be displayed, and the data will be loaded into the dashboard.")
+            ]),
+            html.H2("Using Tabs"),
+            html.P("Navigate through the following tabs to view and analyze your data:"),
+            html.Ol([
+                html.Li(html.B("Table Data:"), " View the uploaded data in a tabular format. Use filters to refine the displayed data."),
+                html.Li(html.B("Map Visualization:"), " Visualize flight routes on an interactive map."),
+                html.Li(html.B("Analytics:"), " View box plot analyses of flight prices by carrier."),
+                html.Li(html.B("Trendline View:"), " Analyze price trends over time for different airlines.")
+            ]),
+            html.H2("Setting Parameters"),
+            html.Ol([
+                html.Li("Click on the 'Menu' button located in the top-right corner."),
+                html.Li("Select 'Parameters' from the dropdown menu."),
+                html.Li("Adjust the decimal points for numerical precision in the analysis. The default is set to 2 decimal points."),
+                html.Li("The table and graphs will automatically update based on the selected parameter.")
+            ]),
+            html.H2("Sign Out"),
+            html.Ol([
+                html.Li("Click the 'Sign Out' button located in the top-right corner."),
+                html.Li("You will be redirected to the login page."),
+                html.Li("For security reasons, ensure to sign out when you are finished using the application.")
+            ]),
+            html.Br(),
+            html.P("For any further assistance, please contact the support team."),
+            html.P("Contact number 971xxxxxxx"),
+            html.H2("Thank you"),
+        ])),
+        dbc.ModalFooter(dbc.Button("Close", id="close-help", className="ml-auto")),
+    ],
+    id="help-modal",
+    size="lg",
+)
+
+parameters_modal = dbc.Modal(
+    [
+        dbc.ModalHeader("Parameters"),
+        dbc.ModalBody(html.Div([
+            dbc.Row([
+                dbc.Col(html.Div([
+                    dbc.Label("Decimal Points"),
+                    dcc.Input(id='decimal-points', type='number', value=2, min=0, step=1)
+                ]), width=3),
+            ])
+        ])),
+        dbc.ModalFooter(dbc.Button("Close", id="close-parameters", className="ml-auto")),
+    ],
+    id="parameters-modal",
+    size="md",
+)
+
+app.layout = dbc.Container([
+    dcc.Location(id='url', refresh=True),
+    dbc.Row([
+        dbc.Col(html.H2("Emirates Econometric Analysis", style={'textAlign': 'center', 'fontSize': '36px'}), width=8),
+        dbc.Col(html.Div(id='username-display',
+                         style={'textAlign': 'right', 'marginTop': '20px', 'fontSize': '20px', 'marginLeft': '100px',
+                                'fontWeight': 'bold', 'color': '#007BFF'}), width=2),
+        dbc.Col(dbc.Button('Sign Out', id='sign-out-button', color='danger', style={
+            'marginTop': '20px'
+        }), width=2, style={'textAlign': 'right'})
+    ], justify="bottom"),
+    html.Hr(style={'borderWidth': '3px', 'color': 'black'}),
+    upload_file,
+    html.Hr(style={'borderWidth': '3px', 'color': 'black'}),
+    filters,
+    route_filter,
+    html.Div(id='route-display', style={
+        'textAlign': 'center',
+        'fontSize': '24px',
+        'marginBottom': '20px',
+        'padding': '10px',
+        'backgroundColor': '#f8f9fa',
+        'borderRadius': '10px',
+        'boxShadow': '0 4px 8px rgba(0, 0, 0, 0.1)',
+        'color': '#007BFF'
+    }),
+    html.Br(),
+    html.Br(),
+    dbc.DropdownMenu(
+        label="Menu",
+        children=[
+            dbc.DropdownMenuItem("Parameters", id='menu-parameters'),
+            dbc.DropdownMenuItem("Help", id='menu-help'),
+        ],
+        id='menu-dropdown',
+        style={
+            'position': 'absolute',
+            'top': '220px',
+            'right': '10px',
+            'margin': '10px'
+        }
+    ),
+    dcc.Tabs(id='tabs', children=[
+        dcc.Tab(label='Table Data', value='table-tab',
+                children=[dcc.Loading(id='loading-table', children=[data_display])],
+                style={'backgroundColor': 'white', 'color': 'black'},
+                selected_style={'backgroundColor': 'white', 'color': 'black'}),
+        dcc.Tab(label='Map Visualization', value='map-tab', children=[
+            html.Br(),
+            dcc.Loading(id='loading-map', children=[
+                html.Iframe(id='map-content', srcDoc=None, width='100%', height='600')
+            ])
+        ], style={'backgroundColor': 'white', 'color': 'black'},
+                selected_style={'backgroundColor': 'white', 'color': 'black'}),
+        dcc.Tab(label='Analytics', value='analytics-tab', children=[analytics_display],
+                style={'backgroundColor': 'white', 'color': 'black'},
+                selected_style={'backgroundColor': 'white', 'color': 'black'}),
+        dcc.Tab(label='Trendline View', value='trendline-tab', children=[trendline_display],
+                style={'backgroundColor': 'white', 'color': 'black'},
+                selected_style={'backgroundColor': 'white', 'color': 'black'}),
+        dcc.Tab(label='Product Mapping', value='product-mapping-tab', children=[
+            toggle_button,
+            dcc.Loading(id='loading-product-mapping', children=[
+                html.Br(), dcc.Graph(id='product-mapping-plot')
+            ])
+        ], style={'backgroundColor': 'white', 'color': 'black'},
+                selected_style={'backgroundColor': 'white', 'color': 'black'}),
+        dcc.Tab(label='Summary', value='date-analysis-tab', children=[
+            html.Br(),
+            dbc.Row([
+                dbc.Col(html.Div([
+                    dbc.Label("View by:"),
+                    dcc.RadioItems(
+                        id='date-view-toggle',
+                        options=[
+                            {'label': 'Day of Week', 'value': 'day_of_week'},
+                            {'label': 'Week', 'value': 'week'},
+                            {'label': 'Month', 'value': 'month'}
+                        ],
+                        value='day_of_week',
+                        inline=True
+                    )
+                ]), width=6),
+            ]),
+            html.Br(),
+            dcc.Loading(id='loading-date-analysis', children=[
+                html.Br(),
+                dash_table.DataTable(
+                    id='date-analysis-table',
+                    columns=[],
+                    data=[],
+                    style_data={'backgroundColor': 'White', 'color': 'Black'},
+                    style_header={'backgroundColor': 'Black', 'fontWeight': 'bold', 'color': 'white'},
+                    filter_action="native",
+                    sort_action="native",
+                    export_format='csv',
+                    export_headers='display',
+                    page_current=0,
+                    page_size=10,
+                )
+            ])
+        ], style={'backgroundColor': 'white', 'color': 'black'},
+                selected_style={'backgroundColor': 'white', 'color': 'black'})
+    ]),
+    help_modal,  # Place the help modal here
+    parameters_modal  # Place the parameters modal here
+], fluid=True, style={'height': '100vh'})
+
+
+@app.callback(
+    Output('username-display', 'children'),
+    [Input('url', 'pathname')]
+)
+def display_username(pathname):
+    if 'username' in session:
+        return f" {session['username']}"
+    return ""
+
+
+def parse_date_columns(df, date_columns, date_format='%d/%m/%Y'):
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], format=date_format, errors='coerce')
+    return df
+
+def parse_file_content(file_content):
+    content_type, content_string = file_content.split(',')
+    decoded = base64.b64decode(content_string)
+    df = pd.read_excel(io.BytesIO(decoded))
+
+    # Ensure date columns are parsed as dates with DMY format
+    date_columns = ['outbound_departure_date', 'outbound_arrival_date', 'inbound_departure_date',
+                    'inbound_arrival_date']
+    time_columns = ['outbound_departure_time', 'outbound_arrival_time', 'inbound_departure_time',
+                    'inbound_arrival_time']
+
+    df = parse_date_columns(df, date_columns, date_format='%d/%m/%Y')
+
+    for col in time_columns:
+        if col in df.columns:
+            # Strip extra parts of the time if present and parse
+            df[col] = pd.to_datetime(df[col].astype(str).str[:5], format='%H:%M', errors='coerce').dt.time
+
+    return df
+
+
+
+def add_timezones(df):
+    tf = TimezoneFinder()
+
+    def get_timezone(coordinates):
+        if pd.isnull(coordinates):
+            return None
+        lat, lon = map(float, coordinates.split(','))
+        return tf.timezone_at(lng=lon, lat=lat)
+
+    if 'coordinates_origin' in df.columns:
+        df['Time Zone_origin'] = df['coordinates_origin'].apply(get_timezone)
+    if 'coordinates_destination' in df.columns:
+        df['Time Zone_destination'] = df['coordinates_destination'].apply(get_timezone)
+    if 'coordinates_outbound_stopover' in df.columns:
+        df['Time Zone_outbound_stopover'] = df['coordinates_outbound_stopover'].apply(get_timezone)
+    if 'coordinates_inbound_stopover' in df.columns:
+        df['Time Zone_inbound_stopover'] = df['coordinates_inbound_stopover'].apply(get_timezone)
+
+    return df
+
+
+def add_distances(df):
+    def geopy_distance(coord1, coord2):
+        if pd.isnull(coord1) or pd.isnull(coord2):
+            return 0
+        lat1, lon1 = map(float, coord1.split(','))
+        lat2, lon2 = map(float, coord2.split(','))
+        return geodesic((lat1, lon1), (lat2, lon2)).km
+
+    if 'coordinates_origin' in df.columns and 'coordinates_outbound_stopover' in df.columns:
+        df['distance_origin_to_outbound'] = df.apply(
+            lambda row: geopy_distance(row['coordinates_origin'], row['coordinates_outbound_stopover']), axis=1)
+    if 'coordinates_outbound_stopover' in df.columns and 'coordinates_destination' in df.columns:
+        df['distance_outbound_to_destination'] = df.apply(
+            lambda row: geopy_distance(row['coordinates_outbound_stopover'], row['coordinates_destination']), axis=1)
+    if 'distance_origin_to_outbound' in df.columns and 'distance_outbound_to_destination' in df.columns:
+        df['total_outbound_distance'] = df['distance_origin_to_outbound'] + df['distance_outbound_to_destination']
+
+    if 'coordinates_destination' in df.columns and 'coordinates_inbound_stopover' in df.columns:
+        df['distance_destination_to_inbound'] = df.apply(
+            lambda row: geopy_distance(row['coordinates_destination'], row['coordinates_inbound_stopover']), axis=1)
+    if 'coordinates_inbound_stopover' in df.columns and 'coordinates_origin' in df.columns:
+        df['distance_inbound_to_origin'] = df.apply(
+            lambda row: geopy_distance(row['coordinates_inbound_stopover'], row['coordinates_origin']), axis=1)
+    if 'distance_destination_to_inbound' in df.columns and 'distance_inbound_to_origin' in df.columns:
+        df['total_inbound_distance'] = df['distance_destination_to_inbound'] + df['distance_inbound_to_origin']
+
+    # Ensure total distance is calculated
+    if 'total_outbound_distance' in df.columns and 'total_inbound_distance' in df.columns:
+        df['total_distance'] = df['total_outbound_distance'] + df['total_inbound_distance']
+
+    return df
+
+
+def calculate_travel_time(dep_date, dep_time, dep_tz, arr_date, arr_time, arr_tz):
+    if pd.isnull(dep_date) or pd.isnull(arr_date) or pd.isnull(dep_time) or pd.isnull(arr_time) or not dep_tz or not arr_tz:
+        return 0
+
+    dep_datetime = datetime.combine(dep_date, dep_time)
+    arr_datetime = datetime.combine(arr_date, arr_time)
+
+    dep_tz = pytz.timezone(dep_tz)
+    arr_tz = pytz.timezone(arr_tz)
+
+    dep_datetime = dep_tz.localize(dep_datetime)
+    arr_datetime = arr_tz.localize(arr_datetime)
+
+    dep_datetime_utc = dep_datetime.astimezone(pytz.utc)
+    arr_datetime_utc = arr_datetime.astimezone(pytz.utc)
+
+    travel_time = (arr_datetime_utc - dep_datetime_utc).total_seconds() / 60  # Convert to minutes
+    return travel_time
+
+def merge_with_airports_code(df):
+    merged_df = df.merge(airports_code_df, how='left', left_on='origin', right_on='Airport Code', suffixes=('', '_origin'))
+    merged_df = merged_df.merge(airports_code_df, how='left', left_on='destination', right_on='Airport Code', suffixes=('_origin', '_destination'))
+    merged_df = merged_df.merge(airports_code_df, how='left', left_on='outbound_travel_stop_over', right_on='Airport Code', suffixes=('_destination', '_outbound_stopover'))
+    merged_df = merged_df.merge(airports_code_df, how='left', left_on='inbound_travel_stop_over', right_on='Airport Code', suffixes=('_outbound_stopover', '_inbound_stopover'))
+
+    merged_df = add_timezones(merged_df)
+    merged_df = add_distances(merged_df)
+
+    if all(col in merged_df.columns for col in ['outbound_departure_date', 'outbound_departure_time', 'outbound_arrival_date', 'outbound_arrival_time']):
+        merged_df['outbound_travel_time'] = merged_df.apply(lambda row: calculate_travel_time(row['outbound_departure_date'], row['outbound_departure_time'], row['Time Zone_origin'], row['outbound_arrival_date'], row['outbound_arrival_time'], row['Time Zone_destination']), axis=1)
+
+    if all(col in merged_df.columns for col in ['inbound_departure_date', 'inbound_departure_time', 'inbound_arrival_date', 'inbound_arrival_time']):
+        merged_df['inbound_travel_time'] = merged_df.apply(lambda row: calculate_travel_time(row['inbound_departure_date'], row['inbound_departure_time'], row['Time Zone_destination'], row['inbound_arrival_date'], row['inbound_arrival_time'], row['Time Zone_origin']), axis=1)
+
+    return merged_df
+
+
+    if all(col in merged_df.columns for col in
+           ['outbound_departure_date', 'outbound_departure_time', 'outbound_arrival_date', 'outbound_arrival_time']):
+        merged_df['outbound_travel_time'] = merged_df.apply(
+            lambda row: calculate_travel_time(row['outbound_departure_date'], row['outbound_departure_time'],
+                                              row['Time Zone_origin'], row['outbound_arrival_date'],
+                                              row['outbound_arrival_time'], row['Time Zone_destination']), axis=1)
+
+    if all(col in merged_df.columns for col in
+           ['inbound_departure_date', 'inbound_departure_time', 'inbound_arrival_date', 'inbound_arrival_time']):
+        merged_df['inbound_travel_time'] = merged_df.apply(
+            lambda row: calculate_travel_time(row['inbound_departure_date'], row['inbound_departure_time'],
+                                              row['Time Zone_destination'], row['inbound_arrival_date'],
+                                              row['inbound_arrival_time'], row['Time Zone_origin']), axis=1)
+
+    return merged_df
+
+
+
+def calculate_travel_time(dep_date, dep_time, dep_tz, arr_date, arr_time, arr_tz):
+    if pd.isnull(dep_date) or pd.isnull(arr_date) or pd.isnull(dep_time) or pd.isnull(
+            arr_time) or not dep_tz or not arr_tz:
+        return 0
+
+    dep_datetime = datetime.combine(dep_date, dep_time)
+    arr_datetime = datetime.combine(arr_date, arr_time)
+
+    dep_tz = pytz.timezone(dep_tz)
+    arr_tz = pytz.timezone(arr_tz)
+
+    dep_datetime = dep_tz.localize(dep_datetime)
+    arr_datetime = arr_tz.localize(arr_datetime)
+
+    dep_datetime_utc = dep_datetime.astimezone(pytz.utc)
+    arr_datetime_utc = arr_datetime.astimezone(pytz.utc)
+
+    travel_time = (arr_datetime_utc - dep_datetime_utc).total_seconds() / 60
+    return travel_time
+
+def filter_data(df, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date, time_of_day, airline, decimal_points):
+    df = parse_date_columns(df, ['outbound_departure_date', 'inbound_departure_date'], date_format='%d/%m/%Y')
+
+    if outbound_start_date and outbound_end_date:
+        outbound_start_date = pd.to_datetime(outbound_start_date)  # Ensure these are datetime64[ns]
+        outbound_end_date = pd.to_datetime(outbound_end_date)
+        df = df[(df['outbound_departure_date'] >= outbound_start_date) & (df['outbound_departure_date'] <= outbound_end_date)]
+
+    if inbound_start_date and inbound_end_date:
+        inbound_start_date = pd.to_datetime(inbound_start_date)  # Ensure these are datetime64[ns]
+        inbound_end_date = pd.to_datetime(inbound_end_date)
+        df = df[(df['inbound_departure_date'] >= inbound_start_date) & (df['inbound_departure_date'] <= inbound_end_date)]
+
+    if time_of_day:
+        time_filters = []
+        if 'morning' in time_of_day:
+            time_filters.append(df['outbound_departure_time'].astype(str).str.startswith(('06', '07', '08', '09', '10', '11')))
+        if 'afternoon' in time_of_day:
+            time_filters.append(df['outbound_departure_time'].astype(str).str.startswith(('12', '13', '14', '15', '16', '17')))
+        if 'evening' in time_of_day:
+            time_filters.append(df['outbound_departure_time'].astype(str).str.startswith(('18', '19', '20')))
+        if 'night' in time_of_day:
+            time_filters.append(df['outbound_departure_time'].astype(str).str.startswith(('21', '22', '23', '00', '01', '02', '03', '04', '05')))
+        if time_filters:
+            df = df[pd.concat(time_filters, axis=1).any(axis=1)]
+
+    if airline:
+        df = df[df['carrier'].isin(airline)]
+
+    # Round price-related columns
+    if 'price_inc' in df.columns:
+        df['price_inc'] = df['price_inc'].round(decimal_points)
+    if 'price_exc' in df.columns:
+        df['price_exc'] = df['price_exc'].round(decimal_points)
+
+    return df
+
+
+
+@app.callback(
+    Output('distribution-plot', 'figure'),
+    [Input('plot-selector', 'value')],
+    [State('upload-data', 'contents'),
+     State('outbound-date-picker-range', 'start_date'),
+     State('outbound-date-picker-range', 'end_date'),
+     State('inbound-date-picker-range', 'start_date'),
+     State('inbound-date-picker-range', 'end_date'),
+     State('time-of-day', 'value'),
+     State('airline', 'value'),
+     State('decimal-points', 'value'),
+     State('route-type', 'value')]
+)
+
+def update_distribution_plot(plot_type, file_content, outbound_start_date, outbound_end_date, inbound_start_date,
+                             inbound_end_date, time_of_day, airline, decimal_points, route_type):
+    if plot_type != 'distribution' or file_content is None:
+        return {}
+
+    df = parse_file_content(file_content)
+    merged_df = merge_with_airports_code(df)
+    filtered_df = filter_data(merged_df, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date,
+                              time_of_day, airline, decimal_points)
+
+    fig = go.Figure()
+
+    airlines = filtered_df['carrier'].unique()
+    color_cycle = itertools.cycle(['#FF5733', '#33FF57', '#3357FF', '#FF33A1', '#A133FF', '#33FFA1', '#FF5733'])
+
+    for airline in airlines:
+        airline_data = filtered_df[filtered_df['carrier'] == airline]
+        fig.add_trace(go.Histogram(
+            x=airline_data['price_inc'].round(decimal_points),
+            nbinsx=50,
+            marker_color=next(color_cycle),
+            name=airline,
+            opacity=0.75
+        ))
+
+    fig.update_layout(
+        title="Price Inclusive Distribution by Carrier",
+        xaxis_title="Price Inclusive",
+        yaxis_title="Frequency",
+        barmode='stack',  # Stack bars to show segmented frequencies
+        bargap=0.1,
+        width=1400,
+        height=800,
+        font=dict(size=16)
+    )
+
+    return fig
+
+@app.callback(
+    [
+        Output('upload-data', 'children'),
+        Output('airline', 'options'),
+        Output('data-loaded-message', 'children'),
+        Output('message', 'children'),
+        Output('tabs', 'value'),
+        Output('loading-spinner', 'children'),
+        Output('route-display', 'children')
+    ],
+    [
+        Input('upload-data', 'contents'),
+        Input('route-type', 'value')
+    ],
+    State('upload-data', 'filename')
+)
+def update_filename_and_route_display(file_content, route_type, filename):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return (
+            html.Div(["Drag and Drop or ", html.A("Select Files")]),
+            [],
+            '',
+            'Please upload an Excel file.',
+            'table-tab',
+            html.Div(),
+            ""
+        )
+
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if file_content is None:
+        return (
+            html.Div(["Drag and Drop or ", html.A("Select Files")]),
+            [],
+            '',
+            'Please upload an Excel file.',
+            'table-tab',
+            html.Div(),
+            ""
+        )
+
+    if 'xlsx' in filename:
+        df = parse_file_content(file_content)
+        merged_df = merge_with_airports_code(df)
+        airline_options = [{'label': airline, 'value': airline} for airline in merged_df['carrier'].unique()]
+        origin = df['origin'].iloc[0]
+        destination = df['destination'].iloc[0]
+
+        if route_type == 'outbound':
+            route = f"Route: {origin} -> {destination}"
+        elif route_type == 'inbound':
+            route = f"Route: {destination} -> {origin}"
+        elif route_type == 'both':
+            route = f"Route: {origin} -> {destination} & {destination} -> {origin}"
+        else:
+            route = "Route information not available."
+
+        return (
+            html.Div([f"{filename}"]),
+            airline_options,
+            '------Excel has been loaded------',
+            '',
+            'table-tab',
+            html.Div(),
+            route
+        )
+
+    return (
+        html.Div(["Drag and Drop or ", html.A("Select Files")]),
+        [],
+        '',
+        'Please upload an Excel file.',
+        'table-tab',
+        html.Div(),
+        ""
+    )
+
+@app.callback(
+    [Output('table', 'columns'),
+    Output('table', 'data'),
+    Output('table-container', 'style')],
+    [Input('upload-data', 'contents'),
+    Input('outbound-date-picker-range', 'start_date'),
+    Input('outbound-date-picker-range', 'end_date'),
+    Input('inbound-date-picker-range', 'start_date'),
+    Input('inbound-date-picker-range', 'end_date'),
+    Input('time-of-day', 'value'),
+    Input('airline', 'value'),
+    Input('decimal-points', 'value')]
+)
+def update_table(file_content, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date,
+                time_of_day, airline, decimal_points):
+    if file_content is None:
+        return [], [], {'display': 'none'}
+
+    df = parse_file_content(file_content)
+    merged_df = merge_with_airports_code(df)
+    filtered_df = filter_data(merged_df, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date,
+                            time_of_day, airline, decimal_points)
+
+    columns = [{"name": i, "id": i} for i in filtered_df.columns]
+    data = filtered_df.to_dict('records')
+
+    return columns, data, {'display': 'block'}
+
+@app.callback(
+    Output('map-content', 'srcDoc'),
+    [Input('tabs', 'value'),
+    Input('route-type', 'value'),
+    Input('outbound-date-picker-range', 'start_date'),
+    Input('outbound-date-picker-range', 'end_date'),
+    Input('inbound-date-picker-range', 'start_date'),
+    Input('inbound-date-picker-range', 'end_date'),
+    Input('time-of-day', 'value'),
+    Input('airline', 'value'),
+    Input('decimal-points', 'value')],
+    [State('upload-data', 'contents')]
+)
+def update_map_on_tab_select(tab, route_type, outbound_start_date, outbound_end_date, inbound_start_date,
+                            inbound_end_date, time_of_day, airline, decimal_points, file_content):
+    if tab == 'map-tab' and file_content:
+        df = parse_file_content(file_content)
+        merged_df = merge_with_airports_code(df)
+        filtered_df = filter_data(merged_df, outbound_start_date, outbound_end_date, inbound_start_date,
+                                inbound_end_date, time_of_day, airline, decimal_points)
+        if filtered_df.empty:
+            return None
+        return generate_map_content(filtered_df, route_type)
+    return None
+
+@app.callback(
+    [Output('box-plot', 'style'),
+     Output('distribution-plot', 'style')],
+    [Input('plot-selector', 'value')]
+)
+def toggle_plots(plot_type):
+    if plot_type == 'box':
+        return {'width': '90vw', 'height': '90vh', 'display': 'block'}, {'width': '90vw', 'height': '90vh', 'display': 'none'}
+    elif plot_type == 'distribution':
+        return {'width': '90vw', 'height': '90vh', 'display': 'none'}, {'width': '90vw', 'height': '90vh', 'display': 'block'}
+    return {'width': '90vw', 'height': '90vh', 'display': 'block'}, {'width': '90vw', 'height': '90vh', 'display': 'none'}
+
+
+
+def generate_map_content(df, route_type):
+    tf = TimezoneFinder()
+
+    def get_timezone(coordinates):
+        if pd.isnull(coordinates):
+            return None
+        lat, lon = map(float, coordinates.split(','))
+        return tf.timezone_at(lng=lon, lat=lat)
+
+    def geopy_distance(coord1, coord2):
+        if pd.isnull(coord1) or pd.isnull(coord2):
+            return 0
+        lat1, lon1 = map(float, coord1.split(','))
+        lat2, lon2 = map(float, coord2.split(','))
+        return geodesic((lat1, lon1), (lat2, lon2)).km
+
+    df = add_timezones(df)
+    df = add_distances(df)
+
+    if all(col in df.columns for col in
+           ['outbound_departure_date', 'outbound_departure_time', 'outbound_arrival_date', 'outbound_arrival_time']):
+        df['outbound_travel_time'] = df.apply(
+            lambda row: calculate_travel_time(row['outbound_departure_date'], row['outbound_departure_time'],
+                                              row['Time Zone_origin'], row['outbound_arrival_date'],
+                                              row['outbound_arrival_time'], row['Time Zone_destination']), axis=1)
+
+    if all(col in df.columns for col in
+           ['inbound_departure_date', 'inbound_departure_time', 'inbound_arrival_date', 'inbound_arrival_time']):
+        df['inbound_travel_time'] = df.apply(
+            lambda row: calculate_travel_time(row['inbound_departure_date'], row['inbound_departure_time'],
+                                              row['Time Zone_destination'], row['inbound_arrival_date'],
+                                              row['inbound_arrival_time'], row['Time Zone_origin']), axis=1)
+
+    grouped_df = df.groupby(
+        ['origin', 'destination', 'outbound_travel_stop_over', 'inbound_travel_stop_over', 'carrier']
+    ).agg({
+        'outbound_travel_time': 'mean',
+        'inbound_travel_time': 'mean',
+        'total_outbound_distance': 'mean',
+        'total_inbound_distance': 'mean',
+        'price_inc': 'mean'
+    }).reset_index()
+
+    grouped_df = merge_with_airports_code(grouped_df)
+
+    color_list = ['red', 'blue', 'green', 'purple', 'orange', 'pink', 'cyan', 'magenta']
+    color_cycle = itertools.cycle(color_list)
+    carrier_color_mapping = {}
+
+    def calculate_bearing(lat1, lon1, lat2, lon2):
+        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+        delta_lon = lon2 - lon1
+        x = math.sin(delta_lon) * math.cos(lat2)
+        y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon)
+        bearing = math.atan2(x, y)
+        return (math.degrees(bearing) + 360) % 360
+
+    def add_curved_line_to_map(map_obj, coord1, coord2, flight_info, color, weight=3, base_curvature=0.2, unique_id=0):
+        if pd.notnull(coord1) and pd.notnull(coord2):
+            lat1, lon1 = map(float, coord1.split(','))
+            lat2, lon2 = map(float, coord2.split(','))
+
+            # Calculate distance between the points
+            distance = geodesic((lat1, lon1), (lat2, lon2)).km
+
+            # Adjust curvature based on distance to avoid curves going off the map
+            max_distance_for_curvature = 2000  # Set a threshold for max distance before reducing curvature
+            if distance > max_distance_for_curvature:
+                curvature = base_curvature * (max_distance_for_curvature / distance)
+            else:
+                curvature = base_curvature
+
+            # Introduce a unique offset to the curvature based on the unique_id
+            # This ensures separate curves for the same route but different airlines
+            curvature_offset = curvature + (unique_id % 5) * 0.05  # Vary the curvature slightly for different airlines
+
+            mid_lat = (lat1 + lat2) / 2 + curvature_offset * (lon2 - lon1)
+            mid_lon = (lon1 + lon2) / 2 + curvature_offset * (lat2 - lat1)
+
+            control_points = np.array([[lat1, lon1], [mid_lat, mid_lon], [lat2, lon2]])
+
+            def bezier_curve(t, control_points):
+                n = len(control_points) - 1
+                return sum(comb(n, i) * (1 - t) ** (n - i) * t ** i * control_points[i] for i in range(n + 1))
+
+            t_values = np.linspace(0, 1, 100)
+            bezier_path = [bezier_curve(t, control_points) for t in t_values]
+
+            line = folium.PolyLine(locations=bezier_path, color=color, weight=weight, opacity=0.7)
+            popup = folium.Popup(flight_info, max_width=300)
+            line.add_child(popup)
+            line.add_to(map_obj)
+
+    m = folium.Map(location=[20, 0], zoom_start=2)
+
+    folium.TileLayer('CartoDB positron').add_to(m)
+
+
+    airline_groups = {carrier: folium.FeatureGroup(name=carrier) for carrier in df['carrier'].unique()}
+
+    for carrier_group in airline_groups.values():
+        m.add_child(carrier_group)
+
+    for idx, row in grouped_df.iterrows():
+        if route_type in ['outbound', 'both']:
+            outbound_info = (
+                f"Carrier: {row['carrier']}<br>"
+                f"Route: {row['origin']} -> {row['outbound_travel_stop_over']} -> {row['destination']}<br>"
+                f"Avg Outbound Travel Time: {row['outbound_travel_time']:.2f} minutes<br>"
+                f"Avg Distance: {row['total_outbound_distance']:.2f} km<br>"
+                f"Avg Price: {row['price_inc']:.2f} USD"
+            )
+            if row['carrier'] not in carrier_color_mapping:
+                carrier_color_mapping[row['carrier']] = next(color_cycle)
+
+            color = carrier_color_mapping[row['carrier']]
+            carrier_group = airline_groups[row['carrier']]
+
+            if pd.notnull(row['coordinates_origin']) and pd.notnull(row['coordinates_outbound_stopover']):
+                add_curved_line_to_map(carrier_group, row['coordinates_origin'], row['coordinates_outbound_stopover'],
+                                       outbound_info, color, weight=3, base_curvature=0.2, unique_id=idx)
+            if pd.notnull(row['coordinates_outbound_stopover']) and pd.notnull(row['coordinates_destination']):
+                add_curved_line_to_map(carrier_group, row['coordinates_outbound_stopover'],
+                                       row['coordinates_destination'],
+                                       outbound_info, color, weight=3, base_curvature=0.2, unique_id=idx + 1)
+
+        if route_type in ['inbound', 'both']:
+            inbound_info = (
+                f"Carrier: {row['carrier']}<br>"
+                f"Route: {row['destination']} -> {row['inbound_travel_stop_over']} -> {row['origin']}<br>"
+                f"Avg Inbound Travel Time: {row['inbound_travel_time']:.2f} minutes<br>"
+                f"Avg Distance: {row['total_inbound_distance']:.2f} km<br>"
+                f"Avg Price: {row['price_inc']:.2f} USD"
+            )
+            if row['carrier'] not in carrier_color_mapping:
+                carrier_color_mapping[row['carrier']] = next(color_cycle)
+
+            color = carrier_color_mapping[row['carrier']]
+            carrier_group = airline_groups[row['carrier']]
+
+            if pd.notnull(row['coordinates_destination']) and pd.notnull(row['coordinates_inbound_stopover']):
+                add_curved_line_to_map(carrier_group, row['coordinates_destination'],
+                                       row['coordinates_inbound_stopover'],
+                                       inbound_info, color, weight=3, base_curvature=0.2, unique_id=idx + 2)
+            if pd.notnull(row['coordinates_inbound_stopover']) and pd.notnull(row['coordinates_origin']):
+                add_curved_line_to_map(carrier_group, row['coordinates_inbound_stopover'], row['coordinates_origin'],
+                                       inbound_info, color, weight=3, base_curvature=0.2, unique_id=idx + 3)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    map_html = 'all_flight_paths_with_info.html'
+    m.save(map_html)
+
+    with open(map_html, 'r') as f:
+        map_src_doc = f.read()
+
+    return map_src_doc
+
+@app.callback(
+    Output('parameter-filter', 'style'),
+    [Input('menu-parameters', 'n_clicks')]
+)
+def display_parameter_filter(parameters_click):
+    if parameters_click:
+        return {'display': 'block'}  # Show the parameter filter
+    return {'display': 'none'}  # Keep hidden if not clicked
+
+
+@app.callback(
+    Output('menu-content', 'children'),
+    [Input('menu-parameters', 'n_clicks'),
+     Input('menu-help', 'n_clicks')]
+)
+def display_menu_content(parameters_click, help_click):
+    ctx = dash.callback_context
+
+    if not ctx.triggered:
+        return html.Div()
+
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if button_id == 'menu-parameters':
+        return html.Div()  # Return an empty div or any other content if needed
+    elif button_id == 'menu-help':
+        return dcc.Location(href='/help', id='redirect-help')  # Redirect to the help page
+    return html.Div()
+
+@app.callback(
+    Output('box-plot', 'figure'),
+    [Input('tabs', 'value'),
+    Input('outbound-date-picker-range', 'start_date'),
+    Input('outbound-date-picker-range', 'end_date'),
+    Input('inbound-date-picker-range', 'start_date'),
+    Input('inbound-date-picker-range', 'end_date'),
+    Input('time-of-day', 'value'),
+    Input('airline', 'value'),
+    Input('decimal-points', 'value')],
+    [State('upload-data', 'contents')]
+)
+def update_analytics(tab, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date, time_of_day,
+                    airline, decimal_points, file_content):
+    if tab == 'analytics-tab' and file_content:
+        df = parse_file_content(file_content)
+        merged_df = merge_with_airports_code(df)
+
+        filtered_df = filter_data(merged_df, outbound_start_date, outbound_end_date, inbound_start_date,
+                                inbound_end_date, time_of_day, airline, decimal_points)
+
+        fig = go.Figure()
+
+        color_list = ['red', 'blue', 'green', 'purple', 'orange', 'pink', 'cyan', 'magenta', 'yellow', 'brown']
+        color_cycle = itertools.cycle(color_list)
+
+        median_prices = filtered_df.groupby('carrier')['price_inc'].median().sort_values(ascending=False).round(
+            decimal_points)
+        sorted_carriers = median_prices.index
+
+        for carrier in sorted_carriers:
+            carrier_data = filtered_df[filtered_df['carrier'] == carrier]
+            fig.add_trace(go.Box(
+                y=carrier_data['price_inc'].round(decimal_points),
+                name=carrier,
+                marker_color=next(color_cycle),
+                boxmean='sd',
+                width=0.6,
+                line=dict(width=2),
+                hovertemplate=(
+                    f"Max: {{y.max():.{decimal_points}f}}<br>"
+                    f"Upper Fence: {{upperfence:.{decimal_points}f}}<br>"
+                    f"Q3: {{q3:.{decimal_points}f}}<br>"
+                    f"Mean ± σ: {{mean:.{decimal_points}f}} ± {{sd:.{decimal_points}f}}<br>"
+                    f"Median: {{median:.{decimal_points}f}}<br>"
+                    f"Q1: {{q1:.{decimal_points}f}}<br>"
+                    f"Lower Fence: {{lowerfence:.{decimal_points}f}}<br>"
+                    f"Min: {{y.min():.{decimal_points}f}}<br>"
+                )
+            ))
+
+        overall_mean = round(filtered_df['price_inc'].mean(), decimal_points)
+
+        fig.add_shape(
+            type='line',
+            x0=-0.5,
+            y0=overall_mean,
+            x1=len(filtered_df['carrier'].unique()) - 0.5,
+            y1=overall_mean,
+            line=dict(color='black', width=2, dash='dash'),
+            xref='x',
+            yref='y'
+        )
+
+        currency = filtered_df['currency'].unique()
+        currency_label = ', '.join(currency) if len(currency) > 0 else 'USD'
+        fig.update_layout(
+            title="Price Inclusive Distribution by Carrier",
+            yaxis_title=f"Price Inclusive ({currency_label})",
+            boxmode='group',
+            boxgap=0.1,
+            boxgroupgap=0.05,
+            width=1400,
+            height=800,
+            font=dict(size=16)
+        )
+
+        return fig
+    return {}
+
+@app.callback(
+    Output('trendline-plot', 'figure'),
+    [Input('tabs', 'value'),
+     Input('route-type', 'value'),
+     Input('outbound-date-picker-range', 'start_date'),
+     Input('outbound-date-picker-range', 'end_date'),
+     Input('inbound-date-picker-range', 'start_date'),
+     Input('inbound-date-picker-range', 'end_date'),
+     Input('time-of-day', 'value'),
+     Input('airline', 'value'),
+     Input('decimal-points', 'value'),
+     Input('smooth-checkbox', 'value')],
+    [State('upload-data', 'contents')]
+)
+def update_trendline(tab, route_type, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date,
+                     time_of_day, airline, decimal_points, smooth, file_content):
+    if tab == 'trendline-tab' and file_content:
+        df = parse_file_content(file_content)
+        df = parse_date_columns(df, ['outbound_departure_date', 'inbound_departure_date'])
+
+        if route_type == 'inbound':
+            date_column_name = 'inbound_departure_date'
+        else:
+            date_column_name = 'outbound_departure_date'
+
+        merged_df = merge_with_airports_code(df)
+        filtered_df = filter_data(merged_df, outbound_start_date, outbound_end_date, inbound_start_date,
+                                  inbound_end_date, time_of_day, airline, decimal_points)
+
+        fig = go.Figure()
+
+        airlines = filtered_df['carrier'].unique()
+        color_cycle = itertools.cycle(['#FF5733', '#33FF57', '#3357FF', '#FF33A1', '#A133FF', '#33FFA1', '#FF5733'])
+
+        for airline in airlines:
+            airline_data = filtered_df[filtered_df['carrier'] == airline]
+            x = airline_data[date_column_name].apply(lambda x: x.toordinal())  # Convert dates to ordinal numbers
+            y = airline_data['price_inc'].round(decimal_points).astype(float)  # Ensure y values are floats
+
+            if smooth:
+                smoothed = lowess(y, x, frac=0.05)
+                x_smoothed, y_smoothed = zip(*smoothed)
+                fig.add_trace(go.Scatter(
+                    x=[datetime.fromordinal(int(i)) for i in x_smoothed],  # Convert ordinals back to datetime
+                    y=y_smoothed,
+                    mode='lines',
+                    name=f"{airline} (Smooth)",
+                    line=dict(color=next(color_cycle), width=1),
+                    connectgaps=True
+                ))
+            else:
+                fig.add_trace(go.Scatter(
+                    x=airline_data[date_column_name],
+                    y=y,
+                    mode='lines+markers',
+                    name=airline,
+                    line=dict(color=next(color_cycle), width=1),  # Thinner lines
+                    marker=dict(size=6, symbol='circle', line=dict(width=1)),
+                    connectgaps=True
+                ))
+
+        currency = filtered_df['currency'].unique()
+        currency_label = ', '.join(currency) if len(currency) > 0 else 'USD'
+
+        fig.update_layout(
+            title="Price Trendlines by Airline",
+            xaxis_title="Date",
+            yaxis_title=f"Price ({currency_label})",
+            legend_title="Airlines",
+            width=1400,
+            height=800,
+            font=dict(size=16),
+            xaxis=dict(
+                rangeslider=dict(
+                    visible=True,
+                    thickness=0.05,
+                )
+            ),
+            hovermode='x unified',
+            updatemenus=[
+                {
+                    "buttons": [
+                        {
+                            "args": [{"xaxis.range": [None, None], "yaxis.range": [None, None]}],
+                            "label": "Reset Zoom",
+                            "method": "relayout"
+                        }
+                    ],
+                    "direction": "left",
+                    "pad": {"r": 10, "t": 10},
+                    "showactive": False,
+                    "type": "buttons",
+                    "x": 1.2,
+                    "xanchor": "right",
+                    "y": -0.2,
+                    "yanchor": "bottom"
+                }
+            ]
+        )
+
+        return fig
+    return {}
+
+@app.callback(
+    Output('product-mapping-plot', 'figure'),
+    [Input('tabs', 'value'),
+     Input('route-type', 'value'),
+     Input('outbound-date-picker-range', 'start_date'),
+     Input('outbound-date-picker-range', 'end_date'),
+     Input('inbound-date-picker-range', 'start_date'),
+     Input('inbound-date-picker-range', 'end_date'),
+     Input('time-of-day', 'value'),
+     Input('airline', 'value'),
+     Input('decimal-points', 'value'),
+     Input('y-axis-toggle', 'value')],
+    [State('upload-data', 'contents')]
+)
+def update_product_mapping(tab, route_type, outbound_start_date, outbound_end_date, inbound_start_date,
+                           inbound_end_date, time_of_day, airline, decimal_points, y_axis_value, file_content):
+    if tab == 'product-mapping-tab' and file_content:
+        df = parse_file_content(file_content)
+        merged_df = merge_with_airports_code(df)
+        filtered_df = filter_data(merged_df, outbound_start_date, outbound_end_date, inbound_start_date,
+                                  inbound_end_date, time_of_day, airline, decimal_points)
+
+        # Treat "both" as "outbound"
+        if route_type in ['outbound', 'both']:
+            group_columns = ['carrier', 'outbound_travel_stop_over']
+            travel_time_column = 'outbound_travel_time'
+            stopover_label = 'outbound_travel_stop_over'
+        elif route_type == 'inbound':
+            group_columns = ['carrier', 'inbound_travel_stop_over']
+            travel_time_column = 'inbound_travel_time'
+            stopover_label = 'inbound_travel_stop_over'
+
+        agg_columns = {
+            travel_time_column: 'mean',
+            'price_inc': 'mean',
+            'total_distance': 'mean',
+            'inbound_travel_time': 'mean',
+            'outbound_travel_time': 'mean'
+        }
+
+        grouped_df = filtered_df.groupby(group_columns).agg(agg_columns).reset_index()
+
+        # Calculate price per km for the grouped data
+        grouped_df['price_per_km'] = grouped_df['price_inc'] / grouped_df['total_distance']
+
+        fig = go.Figure()
+
+        color_cycle = itertools.cycle(['#FF5733', '#33FF57', '#3357FF', '#FF33A1', '#A133FF', '#33FFA1', '#FF5733'])
+
+        if y_axis_value == 'price_per_km':
+            y_axis_label = 'Price per km'
+            y_axis_data = 'price_per_km'
+        elif y_axis_value == 'inbound_travel_time':
+            if route_type == 'inbound':
+                y_axis_label = 'Outbound Travel Time (minutes)'
+                y_axis_data = 'outbound_travel_time'
+            else:
+                y_axis_label = 'Inbound Travel Time (minutes)'
+                y_axis_data = 'inbound_travel_time'
+        else:
+            y_axis_label = 'Price Inclusive'
+            y_axis_data = 'price_inc'
+
+        if y_axis_value == 'inbound_travel_time':
+            # Normalize the prices for marker size
+            price_min = grouped_df['price_inc'].min()
+            price_max = grouped_df['price_inc'].max()
+            price_range = price_max - price_min
+
+            def normalize_price(price):
+                return 10 + (price - price_min) / price_range * 30  # Scale between 10 and 40
+
+            grouped_df['marker_size'] = grouped_df['price_inc'].apply(normalize_price)
+        else:
+            grouped_df['marker_size'] = 35  # Set marker size to be three times bigger (35 * 3)
+
+        # Adjust x and y axes for the 'inbound' route
+        for airline in grouped_df['carrier'].unique():
+            airline_data = grouped_df[grouped_df['carrier'] == airline]
+            x_data = airline_data[travel_time_column]
+            y_data = airline_data[y_axis_data].round(decimal_points)
+
+            fig.add_trace(go.Scatter(
+                x=x_data,
+                y=y_data,
+                mode='markers+text',
+                name=airline,
+                marker=dict(
+                    color=next(color_cycle),
+                    size=airline_data['marker_size'],  # Use the normalized prices for marker size
+                    sizemode='area',
+                    sizeref=2. * max(grouped_df['marker_size']) / (40. ** 2) if y_axis_value == 'inbound_travel_time' else 0.3,
+                    sizemin=4  # Minimum size of the markers
+                ),
+                text=airline_data['carrier'],
+                textposition="bottom center",
+                textfont=dict(
+                    size=10,
+                ),
+                hovertemplate=(
+                    '<b>%{text}</b><br>'
+                    'Price: %{y}<br>'
+                    'Stopover: %{customdata[0]}<extra></extra>'
+                ),
+                customdata=airline_data[[stopover_label]].values  # Include stopover information in customdata
+            ))
+
+        # Calculate averages for x and y axes
+        avg_x = grouped_df[travel_time_column].mean()
+        avg_y = grouped_df[y_axis_data].mean()
+
+        # Add lines for quadrants
+        fig.add_shape(
+            type='line',
+            x0=avg_x,
+            y0=grouped_df[y_axis_data].min(),
+            x1=avg_x,
+            y1=grouped_df[y_axis_data].max(),
+            line=dict(
+                color="black",
+                width=2,
+                dash="dash",
+            ),
+        )
+
+        fig.add_shape(
+            type='line',
+            x0=grouped_df[travel_time_column].min(),
+            y0=avg_y,
+            x1=grouped_df[travel_time_column].max(),
+            y1=avg_y,
+            line=dict(
+                color="black",
+                width=2,
+                dash="dash",
+            ),
+        )
+
+        # Add horizontal line for the average price per km
+        if y_axis_value == 'price_per_km':
+            avg_price_per_km = grouped_df['price_per_km'].mean()
+            fig.add_shape(
+                type='line',
+                x0=grouped_df[travel_time_column].min(),
+                x1=grouped_df[travel_time_column].max(),
+                y0=avg_price_per_km,
+                y1=avg_price_per_km,
+                line=dict(
+                    color="red",
+                    width=2,
+                    dash="dash",
+                ),
+            )
+
+        currency = filtered_df['currency'].unique()
+        currency_label = ', '.join(currency) if len(currency) > 0 else 'USD'
+        travel_time_label = 'Outbound Travel Time (minutes)' if route_type in ['outbound', 'both'] else 'Inbound Travel Time (minutes)'
+
+        fig.update_layout(
+            title=f"Product Mapping: {y_axis_label} vs {travel_time_label}",
+            xaxis_title=travel_time_label,
+            yaxis_title=f"{y_axis_label}" if y_axis_data in ['inbound_travel_time','outbound_travel_time']
+            else f"{y_axis_label} ({currency_label})",
+            legend_title="Airlines",
+            width=1400,
+            height=800,
+            font=dict(size=16),
+            hovermode='closest'
+        )
+
+        return fig
+    return {}
+
+@app.callback(
+    [Output('date-analysis-table', 'columns'),
+     Output('date-analysis-table', 'data'),
+     Output('date-analysis-table', 'style_data_conditional')],
+    [Input('tabs', 'value'),
+     Input('upload-data', 'contents'),
+     Input('decimal-points', 'value'),
+     Input('date-view-toggle', 'value'),
+     Input('outbound-date-picker-range', 'start_date'),
+     Input('outbound-date-picker-range', 'end_date'),
+     Input('inbound-date-picker-range', 'start_date'),
+     Input('inbound-date-picker-range', 'end_date'),
+     Input('time-of-day', 'value'),
+     Input('airline', 'value'),
+     Input('route-type', 'value')],
+    [State('upload-data', 'filename')]
+)
+def update_date_analysis_table(tab, file_content, decimal_points, date_view, outbound_start_date, outbound_end_date,
+                               inbound_start_date, inbound_end_date, time_of_day, airline, route_type, filename):
+    if tab == 'date-analysis-tab' and file_content:
+        df = parse_file_content(file_content)
+        df = parse_date_columns(df, ['outbound_departure_date', 'inbound_departure_date'])
+
+        if route_type == 'inbound':
+            date_column = 'inbound_departure_date'
+        else:
+            date_column = 'outbound_departure_date'
+
+        filtered_df = filter_data(df, outbound_start_date, outbound_end_date, inbound_start_date, inbound_end_date,
+                                  time_of_day, airline, decimal_points)
+
+        filtered_df[date_column] = pd.to_datetime(filtered_df[date_column], errors='coerce')
+
+        if date_view == 'day_of_week':
+            filtered_df['day_of_week'] = filtered_df[date_column].dt.day_name()
+            grouped = filtered_df.groupby(['carrier', 'day_of_week']).agg({'price_inc': 'mean'}).reset_index()
+            grouped['price_inc'] = grouped['price_inc'].round(decimal_points)
+            pivot_df = grouped.pivot(index='day_of_week', columns='carrier', values='price_inc').reset_index()
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            pivot_df['day_of_week'] = pd.Categorical(pivot_df['day_of_week'], categories=day_order, ordered=True)
+            pivot_df = pivot_df.sort_values('day_of_week')
+
+        elif date_view == 'week':
+            filtered_df['week_of_year'] = filtered_df[date_column].dt.isocalendar().week
+            grouped = filtered_df.groupby(['carrier', 'week_of_year']).agg({'price_inc': 'mean'}).reset_index()
+            grouped['price_inc'] = grouped['price_inc'].round(decimal_points)
+            pivot_df = grouped.pivot(index='week_of_year', columns='carrier', values='price_inc').reset_index()
+            pivot_df['week_of_year'] = pivot_df['week_of_year'].apply(lambda x: f'Week {x}')
+            pivot_df['week_of_year'] = pd.Categorical(pivot_df['week_of_year'], ordered=True)
+            pivot_df = pivot_df.sort_values('week_of_year')
+
+        else:  # month view
+            filtered_df['month'] = filtered_df[date_column].dt.to_period('M').astype(str)
+            grouped = filtered_df.groupby(['carrier', 'month']).agg({'price_inc': 'mean'}).reset_index()
+            grouped['price_inc'] = grouped['price_inc'].round(decimal_points)
+            pivot_df = grouped.pivot(index='month', columns='carrier', values='price_inc').reset_index()
+            pivot_df['month'] = pd.to_datetime(pivot_df['month'])
+            pivot_df = pivot_df.sort_values('month')
+            pivot_df['month'] = pivot_df['month'].dt.strftime('%B, %Y')
+
+        # Calculate the average for each airline and append it as a new row
+        averages = pivot_df.mean(numeric_only=True).round(decimal_points)
+        averages = pd.DataFrame([averages], columns=pivot_df.columns)
+        averages[pivot_df.columns[0]] = 'Average'  # Set the label for the first column (e.g., 'Average')
+        pivot_df = pd.concat([pivot_df, averages], ignore_index=True)
+
+        columns = [{"name": i, "id": i} for i in pivot_df.columns]
+        data = pivot_df.to_dict('records')
+
+        # Calculate overall min and max values across the entire table (excluding the index column)
+        numeric_columns = pivot_df.columns[1:]  # Exclude the first column (e.g., 'day_of_week', 'week_of_year', 'month')
+        all_values = pivot_df[numeric_columns].values.flatten()
+        min_value = np.min(all_values[np.isfinite(all_values)])  # Handle any NaN values
+        max_value = np.max(all_values[np.isfinite(all_values)])  # Handle any NaN values
+
+        # Define the conditional formatting
+        style_data_conditional = []
+        for column in numeric_columns:
+            # General green gradient for all values
+            num_shades = 10
+            for i in range(num_shades):
+                lower_bound = min_value + (max_value - min_value) * (i / num_shades)
+                upper_bound = min_value + (max_value - min_value) * ((i + 1) / num_shades)
+
+                # Define color for green gradient
+                green_shade = f'rgba({0}, {255 - i * 25}, {0}, 0.5)'
+
+                style_data_conditional.append({
+                    'if': {
+                        'column_id': column,
+                        'filter_query': f'{{{column}}} >= {lower_bound} && {{{column}}} < {upper_bound}',
+                    },
+                    'backgroundColor': green_shade,
+                    'color': 'black'
+                })
+
+            # Special formatting for the lowest and highest values
+            style_data_conditional.append({
+                'if': {
+                    'filter_query': f'{{{column}}} = {min_value}',
+                    'column_id': column
+                },
+                'backgroundColor': 'red',
+                'color': 'black'
+            })
+
+            style_data_conditional.append({
+                'if': {
+                    'filter_query': f'{{{column}}} = {max_value}',
+                    'column_id': column
+                },
+                'backgroundColor': 'darkgreen',
+                'color': 'white'
+            })
+
+        # Special formatting for the "Average" row
+        style_data_conditional.append({
+            'if': {
+                'filter_query': '{' + pivot_df.columns[0] + '} = "Average"',
+            },
+            'backgroundColor': '#D3D3D3',  # Light grey background
+            'fontWeight': 'bold'
+        })
+
+        return columns, data, style_data_conditional
+
+    return [], [], []
+
+@app.callback(
+    Output("help-modal", "is_open"),
+    [Input("menu-help", "n_clicks"), Input("close-help", "n_clicks")],
+    [dash.dependencies.State("help-modal", "is_open")],
+)
+def toggle_help_modal(n1, n2, is_open):
+    if n1 or n2:
+        return not is_open
+    return is_open
+
+@app.callback(
+    Output("parameters-modal", "is_open"),
+    [Input("menu-parameters", "n_clicks"), Input("close-parameters", "n_clicks")],
+    [dash.dependencies.State("parameters-modal", "is_open")],
+)
+def toggle_parameters_modal(n1, n2, is_open):
+    if n1 or n2:
+        return not is_open
+    return is_open
+
+
+if __name__ == "__main__":
+    app.run_server(debug=True)
