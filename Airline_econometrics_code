@@ -381,7 +381,7 @@ parameters_modal = dbc.Modal(
 app.layout = dbc.Container([
     dcc.Location(id='url', refresh=True),
     dbc.Row([
-        dbc.Col(html.H2("Emirates Econometric Analysis", style={'textAlign': 'center', 'fontSize': '36px'}), width=8),
+        dbc.Col(html.H2("Airline Econometric Analysis", style={'textAlign': 'center', 'fontSize': '36px'}), width=8),
         dbc.Col(html.Div(id='username-display',
                          style={'textAlign': 'right', 'marginTop': '20px', 'fontSize': '20px', 'marginLeft': '100px',
                                 'fontWeight': 'bold', 'color': '#007BFF'}), width=2),
